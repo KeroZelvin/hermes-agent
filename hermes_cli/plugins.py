@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from hermes_cli.commands import CommandDef, register_plugin_command
+
 try:
     import yaml
 except ImportError:  # pragma: no cover – yaml is optional at import time
@@ -160,6 +162,51 @@ class PluginContext:
         self._manager._hooks.setdefault(hook_name, []).append(callback)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
+    def register_command(
+        self,
+        name: str,
+        handler: Callable,
+        description: str = "",
+        *,
+        aliases: tuple[str, ...] | list[str] = (),
+        args_hint: str = "",
+        subcommands: tuple[str, ...] | list[str] = (),
+        cli_only: bool = False,
+        gateway_only: bool = False,
+        gateway_config_gate: str | None = None,
+        category: str = "Plugins",
+    ) -> None:
+        """Register a plugin-provided slash command."""
+        command_name = name.strip().lstrip("/").lower()
+        if not command_name:
+            raise ValueError("Plugin command name cannot be empty")
+
+        normalized_aliases = tuple(
+            alias.strip().lstrip("/").lower() for alias in aliases if alias and alias.strip()
+        )
+        normalized_subcommands = tuple(
+            sub.strip() for sub in subcommands if sub and sub.strip()
+        )
+
+        self._manager._plugin_commands[command_name] = handler
+        for alias in normalized_aliases:
+            self._manager._plugin_commands[alias] = handler
+
+        register_plugin_command(
+            CommandDef(
+                name=command_name,
+                description=description or f"Plugin command: {command_name}",
+                category=category,
+                aliases=normalized_aliases,
+                args_hint=args_hint,
+                subcommands=normalized_subcommands,
+                cli_only=cli_only,
+                gateway_only=gateway_only,
+                gateway_config_gate=gateway_config_gate,
+            )
+        )
+        logger.debug("Plugin %s registered command: %s", self.manifest.name, command_name)
+
 
 # ---------------------------------------------------------------------------
 # PluginManager
@@ -172,6 +219,7 @@ class PluginManager:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
+        self._plugin_commands: Dict[str, Callable] = {}
         self._discovered: bool = False
 
     # -----------------------------------------------------------------------
@@ -499,3 +547,10 @@ def get_plugin_toolsets() -> List[tuple]:
         result.append((ts_key, label, desc))
 
     return result
+
+
+def get_plugin_command_handler(name: str) -> Callable | None:
+    """Return a plugin slash-command handler by canonical name or alias."""
+    if not name:
+        return None
+    return get_plugin_manager()._plugin_commands.get(name.strip().lstrip("/").lower())
