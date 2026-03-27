@@ -89,14 +89,18 @@ load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve(
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
 _config_path = _hermes_home / 'config.yaml'
+_gateway_yaml_config: Dict[str, Any] = {}
 if _config_path.exists():
     try:
         import yaml as _yaml
         with open(_config_path, encoding="utf-8") as _f:
             _cfg = _yaml.safe_load(_f) or {}
+        _gateway_yaml_config = _cfg if isinstance(_cfg, dict) else {}
         # Expand ${ENV_VAR} references before bridging to env vars.
         from hermes_cli.config import _expand_env_vars
         _cfg = _expand_env_vars(_cfg)
+        if isinstance(_cfg, dict):
+            _gateway_yaml_config = _cfg
         # Top-level simple values (fallback only — don't override .env)
         for _key, _val in _cfg.items():
             if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:
@@ -290,6 +294,55 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     elif isinstance(model_cfg, dict):
         model = model_cfg.get("default", model)
     return model
+
+
+def _get_discord_workspace_bindings() -> Dict[str, str]:
+    """Return Discord channel/thread -> workspace path bindings from config.yaml."""
+    discord_cfg = _gateway_yaml_config.get("discord", {})
+    if not isinstance(discord_cfg, dict):
+        return {}
+
+    bindings = discord_cfg.get("channel_workspaces") or discord_cfg.get("workspace_bindings") or {}
+    if not isinstance(bindings, dict):
+        return {}
+
+    normalized: Dict[str, str] = {}
+    for raw_key, raw_value in bindings.items():
+        key = str(raw_key).strip()
+        value = str(raw_value).strip()
+        if not key or not value:
+            continue
+        normalized[key] = os.path.abspath(os.path.expanduser(value))
+    return normalized
+
+
+def _resolve_workspace_cwd(source: Optional[SessionSource]) -> str:
+    """Resolve per-source workspace cwd, falling back to global messaging cwd."""
+    default_cwd = os.getenv("MESSAGING_CWD") or os.getenv("TERMINAL_CWD") or str(Path.home())
+    if source is None or source.platform != Platform.DISCORD:
+        return default_cwd
+
+    bindings = _get_discord_workspace_bindings()
+    if not bindings:
+        return default_cwd
+
+    candidates: List[str] = []
+    chat_id = str(source.chat_id).strip() if getattr(source, "chat_id", None) is not None else ""
+    thread_id = str(source.thread_id).strip() if getattr(source, "thread_id", None) is not None else ""
+
+    if chat_id and thread_id:
+        candidates.extend((f"{chat_id}:{thread_id}", f"{chat_id}/{thread_id}"))
+    if thread_id:
+        candidates.append(thread_id)
+    if chat_id:
+        candidates.append(chat_id)
+
+    for candidate in candidates:
+        bound = bindings.get(candidate)
+        if bound:
+            return bound
+
+    return default_cwd
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -2458,7 +2511,7 @@ class GatewayRunner:
                 try:
                     from agent.context_references import preprocess_context_references_async
                     from agent.model_metadata import get_model_context_length
-                    _msg_cwd = os.environ.get("MESSAGING_CWD", os.path.expanduser("~"))
+                    _msg_cwd = _resolve_workspace_cwd(source)
                     _msg_ctx_len = get_model_context_length(
                         self._model, base_url=self._base_url or "")
                     _ctx_result = await preprocess_context_references_async(
@@ -3623,7 +3676,7 @@ class GatewayRunner:
             max_snapshots=cp_cfg.get("max_snapshots", 50),
         )
 
-        cwd = os.getenv("MESSAGING_CWD", str(Path.home()))
+        cwd = _resolve_workspace_cwd(event.source)
         arg = event.get_command_args().strip()
 
         if not arg:
@@ -5332,7 +5385,14 @@ class GatewayRunner:
                             if _p:
                                 _history_media_paths.add(_p)
             
-            result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+            from tools.terminal_tool import clear_task_env_overrides, register_task_env_overrides
+
+            _workspace_cwd = _resolve_workspace_cwd(source)
+            register_task_env_overrides(session_id, {"cwd": _workspace_cwd})
+            try:
+                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+            finally:
+                clear_task_env_overrides(session_id)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done

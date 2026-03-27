@@ -2,6 +2,12 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+Repo-local coordination artifacts for IDE Codex ↔ Hermes live under `.ai/`:
+- `.ai/AGENTS.md` — handoff/status contract
+- `.ai/hermes-status.md` — current task state template
+
+Read this root file for codebase architecture and development rules; use `.ai/` for task coordination and handoff hygiene.
+
 ## Development Environment
 
 ```bash

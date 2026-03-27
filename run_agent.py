@@ -61,6 +61,16 @@ else:
     logger.info("No .env file found. Using system environment variables.")
 
 
+def _resolve_task_cwd(task_id: Optional[str]) -> Optional[str]:
+    """Resolve the default workspace cwd for a task/session."""
+    if task_id:
+        overrides = _task_env_overrides.get(task_id, {})
+        cwd = overrides.get("cwd")
+        if cwd:
+            return cwd
+    return os.getenv("TERMINAL_CWD") or None
+
+
 # Import our tool system
 from model_tools import (
     get_tool_definitions,
@@ -68,7 +78,7 @@ from model_tools import (
     handle_function_call,
     check_toolset_requirements,
 )
-from tools.terminal_tool import cleanup_vm
+from tools.terminal_tool import cleanup_vm, _task_env_overrides
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
@@ -2543,11 +2553,12 @@ class AIAgent:
             prompt_parts.append(skills_prompt)
 
         if not self.skip_context_files:
-            # Use TERMINAL_CWD for context file discovery when set (gateway
-            # mode).  The gateway process runs from the hermes-agent install
-            # dir, so os.getcwd() would pick up the repo's AGENTS.md and
-            # other dev files — inflating token usage by ~10k for no benefit.
-            _context_cwd = os.getenv("TERMINAL_CWD") or None
+            # Use the task/session workspace cwd for context file discovery
+            # when set (gateway mode). The gateway process runs from the
+            # hermes-agent install dir, so os.getcwd() would pick up the repo's
+            # AGENTS.md and other dev files — inflating token usage by ~10k for
+            # no benefit.
+            _context_cwd = _resolve_task_cwd(self.session_id)
             context_files_prompt = build_context_files_prompt(
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
@@ -5121,7 +5132,7 @@ class AIAgent:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                        cwd = function_args.get("workdir") or _resolve_task_cwd(self.session_id) or os.getcwd()
                         self._checkpoint_mgr.ensure_checkpoint(
                             cwd, f"before terminal: {cmd[:60]}"
                         )
@@ -5326,7 +5337,7 @@ class AIAgent:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                        cwd = function_args.get("workdir") or _resolve_task_cwd(self.session_id) or os.getcwd()
                         self._checkpoint_mgr.ensure_checkpoint(
                             cwd, f"before terminal: {cmd[:60]}"
                         )
