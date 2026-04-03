@@ -245,6 +245,15 @@ TOOL_CATEGORIES = {
                 ],
             },
             {
+                "name": "MiniMax Token Plan MCP",
+                "tag": "MiniMax subscription — MCP-backed web search (search only)",
+                "web_backend": "minimax",
+                "env_vars": [
+                    {"key": "MINIMAX_API_KEY", "prompt": "MiniMax API key", "url": "https://platform.minimax.io/subscribe/token-plan"},
+                ],
+                "post_setup": "minimax_mcp_web",
+            },
+            {
                 "name": "Firecrawl Self-Hosted",
                 "tag": "Free - run your own instance",
                 "web_backend": "firecrawl",
@@ -369,7 +378,7 @@ TOOLSET_ENV_REQUIREMENTS = {
 
 # ─── Post-Setup Hooks ─────────────────────────────────────────────────────────
 
-def _run_post_setup(post_setup_key: str):
+def _run_post_setup(post_setup_key: str, config: dict | None = None):
     """Run post-setup hooks for tools that need extra installation steps."""
     import shutil
     if post_setup_key == "browserbase":
@@ -439,6 +448,52 @@ def _run_post_setup(post_setup_key: str):
                 _print_warning("    tinker-atropos submodule not found - run:")
                 _print_info("      git submodule update --init --recursive")
                 _print_info('      uv pip install -e "./tinker-atropos"')
+
+    elif post_setup_key == "minimax_mcp_web":
+        if config is None:
+            _print_warning("    Could not update config for MiniMax MCP: config object missing")
+            return
+
+        uvx_path = shutil.which("uvx") or "uvx"
+        config.setdefault("web", {})["backend"] = "minimax"
+
+        mcp_servers = config.setdefault("mcp_servers", {})
+        minimax_cfg = mcp_servers.setdefault("minimax", {})
+        minimax_cfg["command"] = minimax_cfg.get("command") or uvx_path
+        minimax_cfg["args"] = ["minimax-coding-plan-mcp", "-y"]
+        minimax_cfg["connect_timeout"] = minimax_cfg.get("connect_timeout", 120)
+        minimax_cfg["timeout"] = minimax_cfg.get("timeout", 120)
+
+        env_cfg = minimax_cfg.setdefault("env", {})
+        env_cfg["MINIMAX_API_KEY"] = "${MINIMAX_API_KEY}"
+        env_cfg["MINIMAX_API_HOST"] = env_cfg.get("MINIMAX_API_HOST") or "https://api.minimax.io"
+
+        tools_cfg = minimax_cfg.setdefault("tools", {})
+        include = tools_cfg.get("include")
+        if not isinstance(include, list):
+            include = []
+        if "web_search" not in include:
+            include.append("web_search")
+        tools_cfg["include"] = include
+
+        _print_success(f"    MiniMax MCP server configured with command: {minimax_cfg['command']}")
+        if uvx_path == "uvx":
+            _print_info("    If Hermes later reports 'spawn uvx ENOENT', replace the command with your absolute uvx path in ~/.hermes/config.yaml")
+        _print_info("    Restart Hermes or reload MCP servers to pick up the MiniMax MCP tools")
+
+
+def _invoke_post_setup(post_setup_key: str, config: dict):
+    """Call the post-setup hook while remaining compatible with older 1-arg stubs."""
+    import inspect
+
+    try:
+        params = inspect.signature(_run_post_setup).parameters
+    except (TypeError, ValueError):
+        params = {}
+
+    if len(params) >= 2:
+        return _run_post_setup(post_setup_key, config)
+    return _run_post_setup(post_setup_key)
 
 
 # ─── Platform / Toolset Helpers ───────────────────────────────────────────────
@@ -1035,7 +1090,7 @@ def _configure_provider(provider: dict, config: dict):
 
     if not env_vars:
         if provider.get("post_setup"):
-            _run_post_setup(provider["post_setup"])
+            _invoke_post_setup(provider["post_setup"], config)
         _print_success(f"  {provider['name']} - no configuration needed!")
         if managed_feature:
             _print_info("  Requests for this tool will be billed to your Nous subscription.")
@@ -1074,7 +1129,7 @@ def _configure_provider(provider: dict, config: dict):
 
     # Run post-setup hooks if needed
     if provider.get("post_setup") and all_configured:
-        _run_post_setup(provider["post_setup"])
+        _invoke_post_setup(provider["post_setup"], config)
 
     if all_configured:
         _print_success(f"  {provider['name']} configured!")
@@ -1244,7 +1299,7 @@ def _reconfigure_provider(provider: dict, config: dict):
 
     if not env_vars:
         if provider.get("post_setup"):
-            _run_post_setup(provider["post_setup"])
+            _invoke_post_setup(provider["post_setup"], config)
         _print_success(f"  {provider['name']} - no configuration needed!")
         if managed_feature:
             _print_info("  Requests for this tool will be billed to your Nous subscription.")

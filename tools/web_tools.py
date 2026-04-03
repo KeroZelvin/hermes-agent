@@ -17,6 +17,7 @@ Backend compatibility:
 - Firecrawl: https://docs.firecrawl.dev/introduction (search, extract, crawl; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
 - Tavily: https://tavily.com (search, extract, crawl)
+- MiniMax Token Plan MCP: https://platform.minimax.io/docs/guides/token-plan-mcp-guide (search only via MCP)
 
 LLM Processing:
 - Uses OpenRouter API with Gemini 3 Flash Preview for intelligent content extraction
@@ -65,6 +66,8 @@ from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 
+_MINIMAX_MCP_SEARCH_TOOL = "mcp_minimax_web_search"
+
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
 
@@ -80,6 +83,90 @@ def _load_web_config() -> dict:
     except (ImportError, Exception):
         return {}
 
+
+def _is_minimax_mcp_backend_ready() -> bool:
+    """Return True when the MiniMax MCP web_search tool is registered and connected."""
+    try:
+        toolset = registry.get_toolset_for_tool(_MINIMAX_MCP_SEARCH_TOOL)
+        if toolset != "mcp-minimax" or not registry.is_toolset_available("mcp-minimax"):
+            from tools.mcp_tool import discover_mcp_tools
+
+            discover_mcp_tools()
+            toolset = registry.get_toolset_for_tool(_MINIMAX_MCP_SEARCH_TOOL)
+        return toolset == "mcp-minimax" and registry.is_toolset_available("mcp-minimax")
+    except Exception:
+        return False
+
+
+def _normalize_minimax_search_results(response: dict, limit: int) -> dict:
+    """Normalize MiniMax MCP search results into Hermes's built-in web schema."""
+    organic = response.get("organic") or []
+    web_results = []
+    for idx, item in enumerate(organic[: max(limit, 0)]):
+        snippet = (item.get("snippet") or item.get("description") or "").strip()
+        date = (item.get("date") or "").strip()
+        description = snippet if not date else f"{snippet} ({date})" if snippet else date
+        web_results.append(
+            {
+                "title": (item.get("title") or "").strip(),
+                "url": (item.get("link") or item.get("url") or "").strip(),
+                "description": description,
+                "position": idx + 1,
+            }
+        )
+
+    normalized = {
+        "success": True,
+        "data": {
+            "web": web_results,
+        },
+    }
+
+    related_queries = [
+        item.get("query", "").strip()
+        for item in (response.get("related_searches") or [])
+        if (item.get("query") or "").strip()
+    ]
+    if related_queries:
+        normalized["data"]["related_searches"] = related_queries
+
+    base_resp = response.get("base_resp") or {}
+    if base_resp:
+        normalized["meta"] = {
+            "provider": "minimax-mcp",
+            "status_code": base_resp.get("status_code"),
+            "status_msg": base_resp.get("status_msg"),
+        }
+
+    return normalized
+
+
+def _minimax_mcp_search(query: str, limit: int = 5) -> dict:
+    """Search the web via the MiniMax Token Plan MCP server."""
+    raw_response = registry.dispatch(_MINIMAX_MCP_SEARCH_TOOL, {"query": query})
+    try:
+        outer = json.loads(raw_response)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"MiniMax MCP returned invalid JSON envelope: {exc}") from exc
+
+    if outer.get("error"):
+        raise ValueError(str(outer["error"]))
+
+    result_payload = outer.get("result") or "{}"
+    try:
+        response = json.loads(result_payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"MiniMax MCP returned non-JSON search results: {exc}") from exc
+
+    base_resp = response.get("base_resp") or {}
+    status_code = base_resp.get("status_code")
+    if status_code not in (None, 0, "0"):
+        status_msg = base_resp.get("status_msg") or "MiniMax MCP search failed"
+        raise ValueError(f"MiniMax MCP search failed ({status_code}): {status_msg}")
+
+    return _normalize_minimax_search_results(response, limit)
+
+
 def _get_backend() -> str:
     """Determine which web backend to use.
 
@@ -88,7 +175,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "minimax"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -99,6 +186,7 @@ def _get_backend() -> str:
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
+        ("minimax", _is_minimax_mcp_backend_ready()),
     )
     for backend, available in backend_candidates:
         if available:
@@ -117,7 +205,14 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "minimax":
+        return _is_minimax_mcp_backend_ready()
     return False
+
+
+def _backend_supports_extract(backend: str) -> bool:
+    """Return whether the named backend supports content extraction."""
+    return backend in {"exa", "parallel", "firecrawl", "tavily"}
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
@@ -189,6 +284,7 @@ def _web_requires_env() -> list[str]:
         "TAVILY_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
+        "MINIMAX_API_KEY",
     ]
     if managed_nous_tools_enabled():
         requires.extend(
@@ -1016,7 +1112,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     Search the web for information using available search API backend.
 
     This function provides a generic interface for web search that can work
-    with multiple backends (Parallel or Firecrawl).
+    with multiple backends (Parallel, Firecrawl, Tavily, Exa, or MiniMax MCP).
 
     Note: This function returns search result metadata only (URLs, titles, descriptions).
     Use web_extract_tool to get full content from specific URLs.
@@ -1090,6 +1186,16 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "include_images": False,
             })
             response_data = _normalize_tavily_search_results(raw)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "minimax":
+            logger.info("MiniMax MCP search: '%s' (limit: %d)", query, limit)
+            response_data = _minimax_mcp_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
@@ -1229,6 +1335,19 @@ async def web_extract_tool(
                     "include_images": False,
                 })
                 results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+            elif backend == "minimax":
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "web_extract is not available when web.backend=minimax. "
+                            "MiniMax Token Plan MCP currently exposes web_search only. "
+                            "Switch web.backend to firecrawl, parallel, exa, or tavily for extraction, "
+                            "or use the browser tool for page access."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             else:
                 # ── Firecrawl extraction ──
                 # Determine requested formats for Firecrawl v2
@@ -1884,9 +2003,17 @@ def check_firecrawl_api_key() -> bool:
 
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
-    configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    configured = (_load_web_config().get("backend") or "").lower().strip()
+    if configured in ("exa", "parallel", "firecrawl", "tavily", "minimax"):
         return _is_backend_available(configured)
+    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily", "minimax"))
+
+
+def check_web_extract_backend() -> bool:
+    """Check whether the configured web backend supports extraction."""
+    configured = (_load_web_config().get("backend") or "").lower().strip()
+    if configured in ("exa", "parallel", "firecrawl", "tavily", "minimax"):
+        return _backend_supports_extract(configured) and _is_backend_available(configured)
     return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
 
 
@@ -1925,6 +2052,8 @@ if __name__ == "__main__":
             print("   Using Parallel API (https://parallel.ai)")
         elif backend == "tavily":
             print("   Using Tavily API (https://tavily.com)")
+        elif backend == "minimax":
+            print("   Using MiniMax Token Plan MCP (search-only backend)")
         else:
             if firecrawl_url_available:
                 print(f"   Using self-hosted Firecrawl: {os.getenv('FIRECRAWL_API_URL').strip().rstrip('/')}")
@@ -2058,7 +2187,7 @@ registry.register(
     schema=WEB_EXTRACT_SCHEMA,
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_backend,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",
