@@ -34,6 +34,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional
 from urllib.parse import urljoin
@@ -41,6 +42,7 @@ from urllib.parse import urljoin
 logger = logging.getLogger(__name__)
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import managed_nous_tools_enabled, resolve_openai_audio_api_key
+from tools.tts_registry import RegisteredTTSProvider, get_tts_provider, iter_tts_providers, register_tts_provider
 
 # ---------------------------------------------------------------------------
 # Lazy imports -- providers are imported only when actually used to avoid
@@ -116,6 +118,17 @@ def _load_tts_config() -> Dict[str, Any]:
 def _get_provider(tts_config: Dict[str, Any]) -> str:
     """Get the configured TTS provider name."""
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+
+
+@dataclass(frozen=True)
+class ResolvedTTSProvider:
+    requested_provider: str
+    provider: str
+    provider_entry: Optional[RegisteredTTSProvider]
+    available: bool
+    error: Optional[str]
+    supports_native_opus: bool
+    tts_config: Dict[str, Any]
 
 
 # ===========================================================================
@@ -441,6 +454,232 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     return output_path
 
 
+def _generate_edge_tts_sync(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    logger.info("Generating speech with Edge TTS...")
+    try:
+        asyncio.get_running_loop()
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(
+                lambda: asyncio.run(_generate_edge_tts(text, output_path, tts_config))
+            ).result(timeout=60)
+    except RuntimeError:
+        asyncio.run(_generate_edge_tts(text, output_path, tts_config))
+    return output_path
+
+
+def _is_edge_available(_tts_config: Dict[str, Any]) -> bool:
+    try:
+        _import_edge_tts()
+        return True
+    except ImportError:
+        return False
+
+
+def _is_elevenlabs_available(_tts_config: Dict[str, Any]) -> bool:
+    try:
+        _import_elevenlabs()
+        return bool(os.getenv("ELEVENLABS_API_KEY"))
+    except ImportError:
+        return False
+
+
+def _is_openai_available(_tts_config: Dict[str, Any]) -> bool:
+    try:
+        _import_openai_client()
+        _resolve_openai_audio_client_config()
+        return True
+    except Exception:
+        return False
+
+
+def _is_minimax_available(_tts_config: Dict[str, Any]) -> bool:
+    return bool(os.getenv("MINIMAX_API_KEY"))
+
+
+def _is_neutts_available(_tts_config: Dict[str, Any]) -> bool:
+    return _check_neutts_available()
+
+
+_BUILTIN_TTS_PROVIDERS_REGISTERED = False
+
+
+def _register_builtin_tts_providers() -> None:
+    global _BUILTIN_TTS_PROVIDERS_REGISTERED
+    if _BUILTIN_TTS_PROVIDERS_REGISTERED:
+        return
+
+    builtin_providers = {
+        "edge": (_generate_edge_tts_sync, _is_edge_available, False),
+        "elevenlabs": (_generate_elevenlabs, _is_elevenlabs_available, True),
+        "openai": (_generate_openai_tts, _is_openai_available, True),
+        "minimax": (_generate_minimax_tts, _is_minimax_available, False),
+        "neutts": (_generate_neutts, _is_neutts_available, False),
+    }
+    for name, (synthesize, is_available, supports_native_opus) in builtin_providers.items():
+        if get_tts_provider(name) is None:
+            register_tts_provider(
+                name,
+                synthesize,
+                is_available=is_available,
+                supports_native_opus=supports_native_opus,
+            )
+
+    _BUILTIN_TTS_PROVIDERS_REGISTERED = True
+
+
+def resolve_tts_provider(tts_config: Optional[Dict[str, Any]] = None) -> ResolvedTTSProvider:
+    _register_builtin_tts_providers()
+    config = _load_tts_config() if tts_config is None else tts_config
+    requested_provider = _get_provider(config)
+    provider_entry = get_tts_provider(requested_provider)
+
+    if provider_entry is not None:
+        try:
+            if provider_entry.is_available(config):
+                return ResolvedTTSProvider(
+                    requested_provider=requested_provider,
+                    provider=requested_provider,
+                    provider_entry=provider_entry,
+                    available=True,
+                    error=None,
+                    supports_native_opus=provider_entry.supports_native_opus,
+                    tts_config=config,
+                )
+        except Exception as exc:
+            return ResolvedTTSProvider(
+                requested_provider=requested_provider,
+                provider=requested_provider,
+                provider_entry=provider_entry,
+                available=False,
+                error=str(exc),
+                supports_native_opus=provider_entry.supports_native_opus,
+                tts_config=config,
+            )
+
+    if requested_provider == "edge":
+        neutts_entry = get_tts_provider("neutts")
+        if neutts_entry is not None and neutts_entry.is_available(config):
+            return ResolvedTTSProvider(
+                requested_provider=requested_provider,
+                provider="neutts",
+                provider_entry=neutts_entry,
+                available=True,
+                error=None,
+                supports_native_opus=neutts_entry.supports_native_opus,
+                tts_config=config,
+            )
+
+    if provider_entry is None:
+        error = f"Unknown TTS provider: {requested_provider}"
+    elif requested_provider == "edge":
+        error = "No TTS provider available. Install edge-tts (pip install edge-tts) or set up NeuTTS for local synthesis."
+    elif requested_provider == "elevenlabs":
+        error = "ElevenLabs provider selected but 'elevenlabs' package or ELEVENLABS_API_KEY is missing."
+    elif requested_provider == "openai":
+        error = "OpenAI provider selected but the OpenAI audio backend is not available."
+    elif requested_provider == "minimax":
+        error = "MiniMax provider selected but MINIMAX_API_KEY is missing."
+    elif requested_provider == "neutts":
+        error = "NeuTTS provider selected but neutts is not installed. Run hermes setup and choose NeuTTS, or install espeak-ng and run python -m pip install -U neutts[all]."
+    else:
+        error = f"TTS provider unavailable: {requested_provider}"
+
+    return ResolvedTTSProvider(
+        requested_provider=requested_provider,
+        provider=requested_provider,
+        provider_entry=provider_entry,
+        available=False,
+        error=error,
+        supports_native_opus=bool(provider_entry and provider_entry.supports_native_opus),
+        tts_config=config,
+    )
+
+
+def generate_tts_result(
+    text: str,
+    output_path: Optional[str] = None,
+    tts_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Generate TTS audio through the shared provider-resolution seam."""
+    if not text or not text.strip():
+        return {"success": False, "error": "Text is required"}
+
+    if len(text) > MAX_TEXT_LENGTH:
+        logger.warning("TTS text too long (%d chars), truncating to %d", len(text), MAX_TEXT_LENGTH)
+        text = text[:MAX_TEXT_LENGTH]
+
+    resolved = resolve_tts_provider(tts_config)
+    provider = resolved.provider
+    if not resolved.available or resolved.provider_entry is None:
+        error_msg = f"TTS configuration error ({provider}): {resolved.error or 'provider unavailable'}"
+        logger.error("%s", error_msg)
+        return {"success": False, "error": error_msg}
+
+    platform = os.getenv("HERMES_SESSION_PLATFORM", "").lower()
+    want_opus = (platform == "telegram")
+
+    if output_path:
+        file_path = Path(output_path).expanduser()
+    else:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = Path(DEFAULT_OUTPUT_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        suffix = ".ogg" if want_opus and resolved.supports_native_opus else ".mp3"
+        file_path = out_dir / f"tts_{timestamp}{suffix}"
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_str = str(file_path)
+
+    try:
+        generated_path = resolved.provider_entry.synthesize(text, file_str, resolved.tts_config)
+        if generated_path:
+            file_str = generated_path
+
+        if not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
+            return {
+                "success": False,
+                "error": f"TTS generation produced no output (provider: {provider})",
+            }
+
+        voice_compatible = False
+        if not resolved.supports_native_opus and not file_str.endswith(".ogg"):
+            opus_path = _convert_to_opus(file_str)
+            if opus_path:
+                file_str = opus_path
+                voice_compatible = True
+        else:
+            voice_compatible = file_str.endswith(".ogg")
+
+        file_size = os.path.getsize(file_str)
+        logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
+
+        media_tag = f"MEDIA:{file_str}"
+        if voice_compatible:
+            media_tag = f"[[audio_as_voice]]\n{media_tag}"
+
+        return {
+            "success": True,
+            "file_path": file_str,
+            "media_tag": media_tag,
+            "provider": provider,
+            "voice_compatible": voice_compatible,
+        }
+
+    except ValueError as e:
+        error_msg = f"TTS configuration error ({provider}): {e}"
+        logger.error("%s", error_msg)
+        return {"success": False, "error": error_msg}
+    except FileNotFoundError as e:
+        error_msg = f"TTS dependency missing ({provider}): {e}"
+        logger.error("%s", error_msg, exc_info=True)
+        return {"success": False, "error": error_msg}
+    except Exception as e:
+        error_msg = f"TTS generation failed ({provider}): {e}"
+        logger.error("%s", error_msg, exc_info=True)
+        return {"success": False, "error": error_msg}
+
+
 # ===========================================================================
 # Main tool function
 # ===========================================================================
@@ -465,160 +704,7 @@ def text_to_speech_tool(
     Returns:
         str: JSON result with success, file_path, and optionally MEDIA tag.
     """
-    if not text or not text.strip():
-        return json.dumps({"success": False, "error": "Text is required"}, ensure_ascii=False)
-
-    # Truncate very long text with a warning
-    if len(text) > MAX_TEXT_LENGTH:
-        logger.warning("TTS text too long (%d chars), truncating to %d", len(text), MAX_TEXT_LENGTH)
-        text = text[:MAX_TEXT_LENGTH]
-
-    tts_config = _load_tts_config()
-    provider = _get_provider(tts_config)
-
-    # Detect platform from gateway env var to choose the best output format.
-    # Telegram voice bubbles require Opus (.ogg); OpenAI and ElevenLabs can
-    # produce Opus natively (no ffmpeg needed).  Edge TTS always outputs MP3
-    # and needs ffmpeg for conversion.
-    platform = os.getenv("HERMES_SESSION_PLATFORM", "").lower()
-    want_opus = (platform == "telegram")
-
-    # Determine output path
-    if output_path:
-        file_path = Path(output_path).expanduser()
-    else:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = Path(DEFAULT_OUTPUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        # Use .ogg for Telegram with providers that support native Opus output,
-        # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        if want_opus and provider in ("openai", "elevenlabs"):
-            file_path = out_dir / f"tts_{timestamp}.ogg"
-        else:
-            file_path = out_dir / f"tts_{timestamp}.mp3"
-
-    # Ensure parent directory exists
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_str = str(file_path)
-
-    try:
-        # Generate audio with the configured provider
-        if provider == "elevenlabs":
-            try:
-                _import_elevenlabs()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "ElevenLabs provider selected but 'elevenlabs' package not installed. Run: pip install elevenlabs"
-                }, ensure_ascii=False)
-            logger.info("Generating speech with ElevenLabs...")
-            _generate_elevenlabs(text, file_str, tts_config)
-
-        elif provider == "openai":
-            try:
-                _import_openai_client()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "OpenAI provider selected but 'openai' package not installed."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with OpenAI TTS...")
-            _generate_openai_tts(text, file_str, tts_config)
-
-        elif provider == "minimax":
-            logger.info("Generating speech with MiniMax TTS...")
-            _generate_minimax_tts(text, file_str, tts_config)
-
-        elif provider == "neutts":
-            if not _check_neutts_available():
-                return json.dumps({
-                    "success": False,
-                    "error": "NeuTTS provider selected but neutts is not installed. "
-                             "Run hermes setup and choose NeuTTS, or install espeak-ng and run python -m pip install -U neutts[all]."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with NeuTTS (local)...")
-            _generate_neutts(text, file_str, tts_config)
-
-        else:
-            # Default: Edge TTS (free), with NeuTTS as local fallback
-            edge_available = True
-            try:
-                _import_edge_tts()
-            except ImportError:
-                edge_available = False
-
-            if edge_available:
-                logger.info("Generating speech with Edge TTS...")
-                try:
-                    loop = asyncio.get_running_loop()
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        pool.submit(
-                            lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-                        ).result(timeout=60)
-                except RuntimeError:
-                    asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-            elif _check_neutts_available():
-                logger.info("Edge TTS not available, falling back to NeuTTS (local)...")
-                provider = "neutts"
-                _generate_neutts(text, file_str, tts_config)
-            else:
-                return json.dumps({
-                    "success": False,
-                    "error": "No TTS provider available. Install edge-tts (pip install edge-tts) "
-                             "or set up NeuTTS for local synthesis."
-                }, ensure_ascii=False)
-
-        # Check the file was actually created
-        if not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
-            return json.dumps({
-                "success": False,
-                "error": f"TTS generation produced no output (provider: {provider})"
-            }, ensure_ascii=False)
-
-        # Try Opus conversion for Telegram compatibility
-        # Edge TTS outputs MP3, NeuTTS outputs WAV — both need ffmpeg conversion
-        voice_compatible = False
-        if provider in ("edge", "neutts", "minimax") and not file_str.endswith(".ogg"):
-            opus_path = _convert_to_opus(file_str)
-            if opus_path:
-                file_str = opus_path
-                voice_compatible = True
-        elif provider in ("elevenlabs", "openai"):
-            # These providers can output Opus natively if the path ends in .ogg
-            voice_compatible = file_str.endswith(".ogg")
-
-        file_size = os.path.getsize(file_str)
-        logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
-
-        # Build response with MEDIA tag for platform delivery
-        media_tag = f"MEDIA:{file_str}"
-        if voice_compatible:
-            media_tag = f"[[audio_as_voice]]\n{media_tag}"
-
-        return json.dumps({
-            "success": True,
-            "file_path": file_str,
-            "media_tag": media_tag,
-            "provider": provider,
-            "voice_compatible": voice_compatible,
-        }, ensure_ascii=False)
-
-    except ValueError as e:
-        # Configuration errors (missing API keys, etc.)
-        error_msg = f"TTS configuration error ({provider}): {e}"
-        logger.error("%s", error_msg)
-        return json.dumps({"success": False, "error": error_msg}, ensure_ascii=False)
-    except FileNotFoundError as e:
-        # Missing dependencies or files
-        error_msg = f"TTS dependency missing ({provider}): {e}"
-        logger.error("%s", error_msg, exc_info=True)
-        return json.dumps({"success": False, "error": error_msg}, ensure_ascii=False)
-    except Exception as e:
-        # Unexpected errors
-        error_msg = f"TTS generation failed ({provider}): {e}"
-        logger.error("%s", error_msg, exc_info=True)
-        return json.dumps({"success": False, "error": error_msg}, ensure_ascii=False)
+    return json.dumps(generate_tts_result(text=text, output_path=output_path), ensure_ascii=False)
 
 
 # ===========================================================================
@@ -626,35 +712,19 @@ def text_to_speech_tool(
 # ===========================================================================
 def check_tts_requirements() -> bool:
     """
-    Check if at least one TTS provider is available.
-
-    Edge TTS needs no API key and is the default, so if the package
-    is installed, TTS is available.
+    Check if at least one registered TTS provider is available.
 
     Returns:
         bool: True if at least one provider can work.
     """
-    try:
-        _import_edge_tts()
-        return True
-    except ImportError:
-        pass
-    try:
-        _import_elevenlabs()
-        if os.getenv("ELEVENLABS_API_KEY"):
-            return True
-    except ImportError:
-        pass
-    try:
-        _import_openai_client()
-        if _has_openai_audio_backend():
-            return True
-    except ImportError:
-        pass
-    if os.getenv("MINIMAX_API_KEY"):
-        return True
-    if _check_neutts_available():
-        return True
+    _register_builtin_tts_providers()
+    config = _load_tts_config()
+    for _name, provider in iter_tts_providers():
+        try:
+            if provider.is_available(config):
+                return True
+        except Exception:
+            continue
     return False
 
 

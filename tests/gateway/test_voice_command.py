@@ -7,6 +7,7 @@ import queue
 import sys
 import threading
 import time
+from pathlib import Path
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -352,9 +353,9 @@ class TestSendVoiceReply:
         event = _make_event()
         runner.adapters[event.source.platform] = mock_adapter
 
-        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
+        tts_result = {"success": True, "file_path": "/tmp/test.ogg"}
 
-        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
+        with patch("tools.tts_tool.generate_tts_result", return_value=tts_result), \
              patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
@@ -366,10 +367,39 @@ class TestSendVoiceReply:
         assert call_args.kwargs.get("chat_id") == "123"
 
     @pytest.mark.asyncio
+    async def test_uses_shared_generate_tts_result_and_cleans_requested_and_actual_paths(self, runner, tmp_path):
+        mock_adapter = AsyncMock()
+        mock_adapter.send_voice = AsyncMock()
+        event = _make_event()
+        runner.adapters[event.source.platform] = mock_adapter
+
+        actual_path = tmp_path / "hermes_voice" / "actual.ogg"
+        actual_path.parent.mkdir(parents=True, exist_ok=True)
+        actual_path.write_bytes(b"voice")
+
+        with patch("tools.tts_tool.generate_tts_result", return_value={
+            "success": True,
+            "file_path": str(actual_path),
+        }) as mock_generate, \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tempfile.gettempdir", return_value=str(tmp_path)), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.makedirs"):
+            await runner._send_voice_reply(event, "Hello world")
+
+        mock_generate.assert_called_once()
+        requested_path = Path(mock_generate.call_args.kwargs["output_path"])
+        assert requested_path.parent == tmp_path / "hermes_voice"
+        assert requested_path.suffix == ".mp3"
+        mock_adapter.send_voice.assert_called_once()
+        assert mock_adapter.send_voice.call_args.kwargs["audio_path"] == str(actual_path)
+        assert not actual_path.exists()
+
+    @pytest.mark.asyncio
     async def test_empty_text_after_strip_skips(self, runner):
         event = _make_event()
 
-        with patch("tools.tts_tool.text_to_speech_tool") as mock_tts, \
+        with patch("tools.tts_tool.generate_tts_result") as mock_tts, \
              patch("tools.tts_tool._strip_markdown_for_tts", return_value=""):
             await runner._send_voice_reply(event, "```code only```")
 
@@ -380,9 +410,9 @@ class TestSendVoiceReply:
         event = _make_event()
         mock_adapter = AsyncMock()
         runner.adapters[event.source.platform] = mock_adapter
-        tts_result = json.dumps({"success": False, "error": "API error"})
+        tts_result = {"success": False, "error": "API error"}
 
-        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
+        with patch("tools.tts_tool.generate_tts_result", return_value=tts_result), \
              patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.path.isfile", return_value=False), \
              patch("os.makedirs"):
@@ -393,7 +423,7 @@ class TestSendVoiceReply:
     @pytest.mark.asyncio
     async def test_exception_caught(self, runner):
         event = _make_event()
-        with patch("tools.tts_tool.text_to_speech_tool", side_effect=RuntimeError("boom")), \
+        with patch("tools.tts_tool.generate_tts_result", side_effect=RuntimeError("boom")), \
              patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.makedirs"):
             # Should not raise
@@ -1884,10 +1914,10 @@ class TestSendVoiceReplyCleanup:
         audio_file = fake_audio / "test.mp3"
         audio_file.write_bytes(b"fake audio")
 
-        tts_result = json.dumps({
+        tts_result = {
             "success": True,
             "file_path": str(audio_file),
-        })
+        }
 
         with patch("gateway.run.asyncio.to_thread", new_callable=AsyncMock, return_value=tts_result), \
              patch("tools.tts_tool._strip_markdown_for_tts", return_value="hello"), \
