@@ -5993,19 +5993,11 @@ class HermesCLI:
                 try:
                     from tools.tts_tool import (
                         _load_tts_config as _load_tts_cfg,
-                        _get_provider as _get_prov,
-                        _import_elevenlabs,
-                        _import_sounddevice,
+                        streaming_tts_available,
                         stream_tts_to_speaker,
                     )
                     _tts_cfg = _load_tts_cfg()
-                    if _get_prov(_tts_cfg) == "elevenlabs":
-                        # Verify both ElevenLabs SDK and audio output are available
-                        _import_elevenlabs()
-                        _import_sounddevice()
-                        use_streaming_tts = True
-                except (ImportError, OSError):
-                    pass
+                    use_streaming_tts = streaming_tts_available(_tts_cfg, validate_setup=True)
                 except Exception:
                     pass
 
