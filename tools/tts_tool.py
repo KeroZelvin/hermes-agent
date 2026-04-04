@@ -6,7 +6,7 @@ Supports five TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
-- MiniMax TTS: High-quality with voice cloning, needs MINIMAX_API_KEY
+- MiniMax TTS: High-quality batch TTS with optional websocket live streaming, needs MINIMAX_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
 
 Output formats:
@@ -70,6 +70,18 @@ def _import_sounddevice():
     return sd
 
 
+def _import_websockets():
+    """Lazy import websockets. Returns the module or raises ImportError."""
+    import websockets
+    return websockets
+
+
+def _import_httpx():
+    """Lazy import httpx. Returns the module or raises ImportError."""
+    import httpx
+    return httpx
+
+
 # ===========================================================================
 # Defaults
 # ===========================================================================
@@ -82,8 +94,10 @@ DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
 DEFAULT_OPENAI_VOICE = "alloy"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MINIMAX_MODEL = "speech-2.8-hd"
-DEFAULT_MINIMAX_VOICE_ID = "English_Graceful_Lady"
-DEFAULT_MINIMAX_BASE_URL = "https://api.minimax.io/v1/t2a_v2"
+DEFAULT_MINIMAX_VOICE_ID = "English_BossyLeader"
+DEFAULT_MINIMAX_BASE_URL = "https://api.minimax.io"
+DEFAULT_MINIMAX_STREAMING_MODE = "disabled"
+
 
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
@@ -304,88 +318,179 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 # ===========================================================================
 # Provider: MiniMax TTS
 # ===========================================================================
-def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
-    """
-    Generate audio using MiniMax TTS API.
+_MINIMAX_VOICE_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
-    MiniMax returns hex-encoded audio data. Supports streaming (SSE) and
-    non-streaming modes. This implementation uses non-streaming for simplicity.
 
-    Args:
-        text: Text to convert (max 10,000 characters).
-        output_path: Where to save the audio file.
-        tts_config: TTS config dict.
+def _normalize_minimax_base_url(base_url: str) -> str:
+    normalized = (base_url or DEFAULT_MINIMAX_BASE_URL).strip().rstrip("/")
+    if normalized.endswith("/v1"):
+        normalized = normalized[:-3]
+    if normalized.endswith("/v1/t2a_v2"):
+        normalized = normalized[:-10]
+    return normalized or DEFAULT_MINIMAX_BASE_URL
 
-    Returns:
-        Path to the saved audio file.
-    """
-    import requests
+
+def _minimax_runtime(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    minimax = tts_config.get("minimax", {})
+    model = (minimax.get("model") or DEFAULT_MINIMAX_MODEL).strip() or DEFAULT_MINIMAX_MODEL
+    if model != DEFAULT_MINIMAX_MODEL:
+        raise ValueError(
+            f"MiniMax model '{model}' is unsupported for this phase; use {DEFAULT_MINIMAX_MODEL}"
+        )
 
     api_key = os.getenv("MINIMAX_API_KEY", "")
     if not api_key:
         raise ValueError("MINIMAX_API_KEY not set. Get one at https://platform.minimax.io/")
 
-    mm_config = tts_config.get("minimax", {})
-    model = mm_config.get("model", DEFAULT_MINIMAX_MODEL)
-    voice_id = mm_config.get("voice_id", DEFAULT_MINIMAX_VOICE_ID)
-    speed = mm_config.get("speed", 1)
-    vol = mm_config.get("vol", 1)
-    pitch = mm_config.get("pitch", 0)
-    base_url = mm_config.get("base_url", DEFAULT_MINIMAX_BASE_URL)
-
-    # Determine audio format from output extension
-    if output_path.endswith(".wav"):
-        audio_format = "wav"
-    elif output_path.endswith(".flac"):
-        audio_format = "flac"
-    else:
-        audio_format = "mp3"
-
-    payload = {
+    return {
+        "api_key": api_key,
+        "base_url": _normalize_minimax_base_url(
+            (minimax.get("base_url") or os.getenv("MINIMAX_BASE_URL") or DEFAULT_MINIMAX_BASE_URL)
+        ),
         "model": model,
+        "voice_id": (minimax.get("voice_id") or "").strip(),
+        "voice_name": (minimax.get("voice_name") or "").strip(),
+        "streaming_mode": (minimax.get("streaming_mode") or DEFAULT_MINIMAX_STREAMING_MODE).strip().lower(),
+        "speed": float(minimax.get("speed", 1.0)),
+        "vol": float(minimax.get("vol", 1.0)),
+        "pitch": int(minimax.get("pitch", 0)),
+    }
+
+
+def _parse_minimax_status_code(payload: Dict[str, Any], label: str) -> None:
+    base_resp = payload.get("base_resp")
+    if not isinstance(base_resp, dict):
+        raise ValueError(f"{label} response envelope is malformed")
+
+    status_code = base_resp.get("status_code", -1)
+    if status_code == 0:
+        return
+
+    status_msg = base_resp.get("status_msg", "unknown error")
+    if status_code == 2061:
+        raise ValueError(f"MiniMax unsupported plan/model: status_code=2061 ({status_msg})")
+    raise ValueError(f"MiniMax {label} failed: status_code={status_code} {status_msg}")
+
+
+def _call_minimax_api(
+    base_url: str,
+    path: str,
+    api_key: str,
+    payload: Dict[str, Any],
+    label: str,
+) -> Dict[str, Any]:
+    httpx = _import_httpx()
+    url = f"{_normalize_minimax_base_url(base_url)}{path}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(url, json=payload, headers=headers)
+        data = response.json()
+        if response.status_code >= 400:
+            base_resp = data.get("base_resp", {}) if isinstance(data, dict) else {}
+            raise ValueError(
+                f"MiniMax {label} request failed (HTTP {response.status_code}): "
+                f"status_code={base_resp.get('status_code', 'unknown')} {base_resp.get('status_msg', 'unknown error')}"
+            )
+        _parse_minimax_status_code(data, label)
+        return data
+
+
+def _extract_minimax_audio_url(payload: Dict[str, Any]) -> str:
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        raise ValueError("MiniMax TTS response envelope is malformed")
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("MiniMax TTS response envelope is malformed")
+    audio_url = data.get("audio")
+    if not audio_url:
+        raise ValueError("MiniMax TTS did not return an audio URL")
+    return str(audio_url)
+
+
+def _download_minimax_audio(url: str, output_path: str) -> None:
+    httpx = _import_httpx()
+    with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+        response = client.get(url)
+        response.raise_for_status()
+        Path(output_path).write_bytes(response.content)
+
+
+def _get_minimax_system_voices(api_key: str, base_url: str) -> list[dict[str, Any]]:
+    cache_key = (_normalize_minimax_base_url(base_url), api_key)
+    if cache_key in _MINIMAX_VOICE_CACHE:
+        return _MINIMAX_VOICE_CACHE[cache_key]
+
+    payload = {"voice_type": "system"}
+    response = _call_minimax_api(base_url, "/v1/get_voice", api_key, payload, "voice lookup")
+    voices = response.get("system_voice")
+    if not isinstance(voices, list):
+        voices = []
+    _MINIMAX_VOICE_CACHE[cache_key] = voices
+    return voices
+
+
+def _resolve_minimax_voice(api_key: str, minimax_config: Dict[str, Any], base_url: str) -> str:
+    explicit_voice_id = (minimax_config.get("voice_id") or minimax_config.get("voice") or "").strip()
+    if explicit_voice_id:
+        return explicit_voice_id
+
+    requested_name = (minimax_config.get("voice_name") or "").strip()
+    voices = _get_minimax_system_voices(api_key, base_url)
+    if requested_name:
+        for voice in voices:
+            if (voice.get("voice_name") or "").casefold() == requested_name.casefold():
+                return (voice.get("voice_id") or "").strip()
+        raise ValueError(f"No MiniMax system voice matched: {requested_name}")
+
+    if not voices:
+        raise ValueError("No MiniMax system voices returned by the API")
+    default_voice_id = (voices[0].get("voice_id") or "").strip()
+    if not default_voice_id:
+        raise ValueError("MiniMax voice list did not include a usable voice_id")
+    return default_voice_id
+
+
+def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    runtime = _minimax_runtime(tts_config)
+    target_path = output_path
+    requested_ogg = output_path.endswith(".ogg")
+    if requested_ogg:
+        target_path = output_path.rsplit(".", 1)[0] + ".mp3"
+
+    voice_id = _resolve_minimax_voice(runtime["api_key"], tts_config.get("minimax", {}), runtime["base_url"])
+    payload = {
+        "model": runtime["model"],
         "text": text,
-        "stream": False,
         "voice_setting": {
             "voice_id": voice_id,
-            "speed": speed,
-            "vol": vol,
-            "pitch": pitch,
+            "speed": runtime["speed"],
+            "vol": runtime["vol"],
+            "pitch": runtime["pitch"],
         },
         "audio_setting": {
+            "format": "mp3",
             "sample_rate": 32000,
             "bitrate": 128000,
-            "format": audio_format,
             "channel": 1,
         },
+        "output_format": "url",
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+    response = _call_minimax_api(runtime["base_url"], "/v1/t2a_v2", runtime["api_key"], payload, "MiniMax TTS")
+    audio_url = _extract_minimax_audio_url({"response": response})
+    _download_minimax_audio(audio_url, target_path)
 
-    response = requests.post(base_url, json=payload, headers=headers, timeout=60)
-    response.raise_for_status()
+    if requested_ogg:
+        opus_path = _convert_to_opus(target_path)
+        if not opus_path:
+            raise ValueError("OGG requested but could not be converted to Opus")
+        return opus_path
 
-    result = response.json()
-    base_resp = result.get("base_resp", {})
-    status_code = base_resp.get("status_code", -1)
-
-    if status_code != 0:
-        status_msg = base_resp.get("status_msg", "unknown error")
-        raise RuntimeError(f"MiniMax TTS API error (code {status_code}): {status_msg}")
-
-    hex_audio = result.get("data", {}).get("audio", "")
-    if not hex_audio:
-        raise RuntimeError("MiniMax TTS returned empty audio data")
-
-    # MiniMax returns hex-encoded audio (not base64)
-    audio_bytes = bytes.fromhex(hex_audio)
-
-    with open(output_path, "wb") as f:
-        f.write(audio_bytes)
-
-    return output_path
+    return target_path
 
 
 # ===========================================================================
@@ -495,7 +600,7 @@ def _is_elevenlabs_available(_tts_config: Dict[str, Any]) -> bool:
 
 
 def _is_elevenlabs_streaming_available(tts_config: Dict[str, Any]) -> bool:
-    if _get_provider(tts_config) != "elevenlabs":
+    if _get_streaming_tts_backend(tts_config) != "elevenlabs":
         return False
     try:
         _import_elevenlabs()
@@ -513,12 +618,21 @@ def _is_openai_available(_tts_config: Dict[str, Any]) -> bool:
         return False
 
 
-def _is_minimax_available(_tts_config: Dict[str, Any]) -> bool:
-    return bool(os.getenv("MINIMAX_API_KEY"))
+def _is_minimax_available(tts_config: Dict[str, Any]) -> bool:
+    try:
+        _import_httpx()
+        _minimax_runtime(tts_config)
+        return True
+    except Exception:
+        return False
 
 
 def _is_neutts_available(_tts_config: Dict[str, Any]) -> bool:
     return _check_neutts_available()
+
+
+def _has_ffplay() -> bool:
+    return shutil.which("ffplay") is not None
 
 
 def _play_pcm_via_tempfile(audio_iter, stop_evt):
@@ -541,6 +655,32 @@ def _play_pcm_via_tempfile(audio_iter, stop_evt):
     except Exception as exc:
         logger.warning("Temp-file TTS fallback failed: %s", exc)
     finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _play_mp3_bytes_via_tempfile(audio_bytes: bytes):
+    tmp_path = None
+    tmp = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        with open(tmp_path, "wb") as handle:
+            handle.write(audio_bytes)
+        from tools.voice_mode import play_audio_file
+        play_audio_file(tmp_path)
+    except Exception as exc:
+        logger.warning("MP3 temp-file TTS fallback failed: %s", exc)
+    finally:
+        if tmp is not None:
+            try:
+                tmp.close()
+            except Exception:
+                pass
         if tmp_path:
             try:
                 os.unlink(tmp_path)
@@ -603,6 +743,177 @@ def _teardown_elevenlabs_streaming(state: Dict[str, Any]) -> None:
             output_stream.close()
         except Exception:
             pass
+
+
+def _get_minimax_ws_url(base_url: str) -> str:
+    normalized = _normalize_minimax_base_url(base_url)
+    if normalized.startswith("https://"):
+        return f"wss://{normalized[len('https://'):]}/ws/v1/t2a_v2"
+    if normalized.startswith("http://"):
+        return f"ws://{normalized[len('http://'):]}/ws/v1/t2a_v2"
+    return f"wss://{normalized}/ws/v1/t2a_v2"
+
+
+def _require_minimax_event(payload: Dict[str, Any], expected_event: str, label: str) -> None:
+    actual_event = (payload.get("event") or "").strip()
+    if actual_event != expected_event:
+        raise ValueError(
+            f"MiniMax {label} returned unexpected event: expected {expected_event}, got {actual_event or 'missing'}"
+        )
+
+
+def _get_streaming_tts_backend(tts_config: Dict[str, Any]) -> Optional[str]:
+    provider = _get_provider(tts_config)
+    if provider == "elevenlabs":
+        return "elevenlabs"
+    if provider == "minimax":
+        mode = ((tts_config.get("minimax", {}) or {}).get("streaming_mode") or DEFAULT_MINIMAX_STREAMING_MODE).strip().lower()
+        if mode == "websocket":
+            return "minimax_websocket"
+    return None
+
+
+def _is_minimax_streaming_available(tts_config: Dict[str, Any]) -> bool:
+    try:
+        if _get_streaming_tts_backend(tts_config) != "minimax_websocket":
+            return False
+        _import_websockets()
+        runtime = _minimax_runtime(tts_config)
+        _resolve_minimax_voice(runtime["api_key"], tts_config.get("minimax", {}), runtime["base_url"])
+        return True
+    except Exception:
+        return False
+
+
+async def _stream_minimax_ws_audio(
+    text: str,
+    runtime: Dict[str, Any],
+    on_audio_chunk: Callable[[bytes], None],
+    stop_event: threading.Event,
+) -> None:
+    websockets = _import_websockets()
+    headers = {"Authorization": f"Bearer {runtime['api_key']}"}
+    ws_url = _get_minimax_ws_url(runtime["base_url"])
+    async with websockets.connect(ws_url, additional_headers=headers, max_size=None) as websocket:
+        connected_payload = json.loads(await websocket.recv())
+        _parse_minimax_status_code(connected_payload, "MiniMax websocket connect")
+        _require_minimax_event(connected_payload, "connected_success", "websocket connect")
+
+        start_payload = {
+            "event": "task_start",
+            "model": runtime["model"],
+            "voice_setting": {
+                "voice_id": runtime["voice_id"],
+                "speed": runtime["speed"],
+                "vol": runtime["vol"],
+                "pitch": runtime["pitch"],
+            },
+            "audio_setting": {
+                "format": "mp3",
+                "sample_rate": 32000,
+                "bitrate": 128000,
+                "channel": 1,
+            },
+        }
+        await websocket.send(json.dumps(start_payload))
+        started_payload = json.loads(await websocket.recv())
+        _parse_minimax_status_code(started_payload, "MiniMax websocket start")
+        _require_minimax_event(started_payload, "task_started", "websocket start")
+
+        await websocket.send(json.dumps({"event": "task_continue", "text": text}))
+        sent_finish = False
+        finish_ack_received = False
+
+        while not stop_event.is_set():
+            message = json.loads(await websocket.recv())
+            _parse_minimax_status_code(message, "MiniMax websocket stream")
+            event = (message.get("event") or "").strip()
+
+            if event == "task_failed":
+                raise ValueError("MiniMax websocket stream failed")
+
+            if event == "task_finished":
+                finish_ack_received = True
+                break
+
+            if sent_finish:
+                raise ValueError(
+                    f"MiniMax websocket finish returned unexpected event: expected task_finished, got {event or 'missing'}"
+                )
+
+            if event != "task_continued":
+                raise ValueError(
+                    f"MiniMax websocket stream returned unexpected event: {event or 'missing'}"
+                )
+
+            audio_hex = ((message.get("data") or {}).get("audio") or "").strip()
+            if audio_hex:
+                on_audio_chunk(bytes.fromhex(audio_hex))
+
+            if message.get("is_final") and not sent_finish:
+                await websocket.send(json.dumps({"event": "task_finish"}))
+                sent_finish = True
+                continue
+
+        if not sent_finish:
+            await websocket.send(json.dumps({"event": "task_finish"}))
+            sent_finish = True
+
+        if sent_finish and not finish_ack_received:
+            finished_payload = json.loads(await websocket.recv())
+            _parse_minimax_status_code(finished_payload, "MiniMax websocket finish")
+            _require_minimax_event(finished_payload, "task_finished", "websocket finish")
+
+
+def _setup_minimax_streaming(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    runtime = _minimax_runtime(tts_config)
+    runtime["voice_id"] = _resolve_minimax_voice(runtime["api_key"], tts_config.get("minimax", {}), runtime["base_url"])
+    return runtime
+
+
+def _stream_sentence_minimax_ws(sentence: str, _tts_config: Dict[str, Any], state: Dict[str, Any], stop_event: threading.Event) -> None:
+    collected: list[bytes] = []
+    ffplay_proc = None
+    ffplay = shutil.which("ffplay")
+    if ffplay:
+        try:
+            ffplay_proc = subprocess.Popen(
+                [ffplay, "-nodisp", "-autoexit", "-loglevel", "error", "-i", "pipe:0"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logger.debug("ffplay unavailable for MiniMax live streaming: %s", exc)
+            ffplay_proc = None
+
+    def _on_chunk(chunk: bytes) -> None:
+        if stop_event.is_set():
+            return
+        collected.append(chunk)
+        if ffplay_proc and ffplay_proc.stdin and ffplay_proc.poll() is None:
+            try:
+                ffplay_proc.stdin.write(chunk)
+                ffplay_proc.stdin.flush()
+            except Exception:
+                pass
+
+    try:
+        asyncio.run(_stream_minimax_ws_audio(sentence, state, _on_chunk, stop_event))
+    finally:
+        if ffplay_proc and ffplay_proc.stdin:
+            try:
+                ffplay_proc.stdin.close()
+                ffplay_proc.wait(timeout=15)
+            except Exception:
+                ffplay_proc.kill()
+
+    if ffplay_proc is None and collected:
+        _play_mp3_bytes_via_tempfile(b"".join(collected))
+
+
+def _teardown_minimax_streaming(_state: Dict[str, Any]) -> None:
+    return None
 
 
 def resolve_streaming_tts_provider(tts_config: Optional[Dict[str, Any]] = None) -> ResolvedStreamingTTSProvider:
@@ -702,6 +1013,10 @@ def _register_builtin_tts_providers() -> None:
             "synthesize": _generate_minimax_tts,
             "is_available": _is_minimax_available,
             "supports_native_opus": False,
+            "is_streaming_available": _is_minimax_streaming_available,
+            "streaming_setup": _setup_minimax_streaming,
+            "stream_sentence": _stream_sentence_minimax_ws,
+            "streaming_teardown": _teardown_minimax_streaming,
         },
         "neutts": {
             "synthesize": _generate_neutts,
@@ -767,7 +1082,11 @@ def resolve_tts_provider(tts_config: Optional[Dict[str, Any]] = None) -> Resolve
     elif requested_provider == "openai":
         error = "OpenAI provider selected but the OpenAI audio backend is not available."
     elif requested_provider == "minimax":
-        error = "MiniMax provider selected but MINIMAX_API_KEY is missing."
+        try:
+            _minimax_runtime(config)
+            error = "MiniMax provider selected but HTTP client support is unavailable."
+        except Exception as exc:
+            error = str(exc)
     elif requested_provider == "neutts":
         error = "NeuTTS provider selected but neutts is not installed. Run hermes setup and choose NeuTTS, or install espeak-ng and run python -m pip install -U neutts[all]."
     else:
@@ -1103,7 +1422,8 @@ if __name__ == "__main__":
         "    API Key:  "
         f"{'set' if resolve_openai_audio_api_key() else 'not set (VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY)'}"
     )
-    print(f"  MiniMax:    {'API key set' if os.getenv('MINIMAX_API_KEY') else 'not set (MINIMAX_API_KEY)'}")
+    print(f"  MiniMax:    {'installed' if _check(_import_httpx, 'httpx') else 'not installed (httpx missing)'}")
+    print(f"    API Key:  {'set' if os.getenv('MINIMAX_API_KEY') else 'not set (MINIMAX_API_KEY)'}")
     print(f"  ffmpeg:     {'✅ found' if _has_ffmpeg() else '❌ not found (needed for Telegram Opus)'}")
     print(f"\n  Output dir: {DEFAULT_OUTPUT_DIR}")
 
