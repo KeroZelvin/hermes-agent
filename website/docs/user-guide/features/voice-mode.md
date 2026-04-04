@@ -44,6 +44,9 @@ pip install "hermes-agent[messaging]"
 # Premium TTS (ElevenLabs)
 pip install "hermes-agent[tts-premium]"
 
+# Optional websocket live-streaming providers (included in the voice extra)
+pip install "hermes-agent[voice]"
+
 # Local TTS (NeuTTS, optional)
 python -m pip install -U neutts[all]
 
@@ -53,7 +56,7 @@ pip install "hermes-agent[all]"
 
 | Extra | Packages | Required For |
 |-------|----------|-------------|
-| `voice` | `sounddevice`, `numpy` | CLI voice mode |
+| `voice` | `sounddevice`, `numpy`, `websockets` | CLI voice mode and websocket live TTS backends |
 | `messaging` | `discord.py[voice]`, `python-telegram-bot`, `aiohttp` | Discord & Telegram bots |
 | `tts-premium` | `elevenlabs` | ElevenLabs TTS provider |
 
@@ -153,11 +156,31 @@ Both `silence_threshold` and `silence_duration` are configurable in `config.yaml
 
 ### Streaming TTS
 
-When TTS is enabled, the agent speaks its reply **sentence-by-sentence** as it generates text — you don't wait for the full response:
+When TTS is enabled, Hermes can speak its reply **sentence-by-sentence** as it generates text — you don't wait for the full response.
 
-1. Buffers text deltas into complete sentences (min 20 chars)
-2. Strips markdown formatting and `<think>` blocks
-3. Generates and plays audio per sentence in real-time
+The live path is now provider-capability based rather than hard-coded to a single provider. The current built-in live backends are:
+
+- **ElevenLabs** live sentence streaming
+- **MiniMax** websocket live sentence streaming (opt-in example backend)
+
+Hermes will:
+
+1. Buffer text deltas into complete sentences (min 20 chars)
+2. Strip markdown formatting and `<think>` blocks
+3. Resolve whether the configured TTS provider has a live backend
+4. Generate and play audio per sentence in real-time when available
+5. Fall back to normal end-of-response TTS when the provider has no live backend
+
+Example MiniMax live config:
+
+```yaml
+tts:
+  provider: minimax
+  minimax:
+    model: speech-2.8-hd
+    voice_id: English_BossyLeader
+    streaming_mode: websocket
+```
 
 ### Hallucination Filter
 

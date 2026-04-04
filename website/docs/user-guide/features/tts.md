@@ -17,7 +17,7 @@ Convert text to speech with five providers:
 | **Edge TTS** (default) | Good | Free | None needed |
 | **ElevenLabs** | Excellent | Paid | `ELEVENLABS_API_KEY` |
 | **OpenAI TTS** | Good | Paid | `VOICE_TOOLS_OPENAI_KEY` |
-| **MiniMax TTS** | Excellent | Paid | `MINIMAX_API_KEY` |
+| **MiniMax** | Excellent | Paid | `MINIMAX_API_KEY` |
 | **NeuTTS** | Good | Free | None needed |
 
 ### Platform Delivery
@@ -45,11 +45,10 @@ tts:
     voice: "alloy"              # alloy, echo, fable, onyx, nova, shimmer
     base_url: "https://api.openai.com/v1"  # Override for OpenAI-compatible TTS endpoints
   minimax:
-    model: "speech-2.8-hd"     # speech-2.8-hd (default), speech-2.8-turbo
-    voice_id: "English_Graceful_Lady"  # See https://platform.minimax.io/faq/system-voice-id
-    speed: 1                    # 0.5 - 2.0
-    vol: 1                      # 0 - 10
-    pitch: 0                    # -12 - 12
+    model: "speech-2.8-hd"
+    voice_id: "English_BossyLeader"
+    streaming_mode: "disabled"  # set to "websocket" for live sentence streaming
+    base_url: "https://api.minimax.io"
   neutts:
     ref_audio: ''
     ref_text: ''
@@ -62,8 +61,7 @@ tts:
 Telegram voice bubbles require Opus/OGG audio format:
 
 - **OpenAI and ElevenLabs** produce Opus natively — no extra setup
-- **Edge TTS** (default) outputs MP3 and needs **ffmpeg** to convert:
-- **MiniMax TTS** outputs MP3 and needs **ffmpeg** to convert for Telegram voice bubbles
+- **Edge TTS** (default) and **MiniMax** output MP3 and need **ffmpeg** to convert
 - **NeuTTS** outputs WAV and also needs **ffmpeg** to convert for Telegram voice bubbles
 
 ```bash
@@ -77,7 +75,7 @@ brew install ffmpeg
 sudo dnf install ffmpeg
 ```
 
-Without ffmpeg, Edge TTS, MiniMax TTS, and NeuTTS audio are sent as regular audio files (playable, but shown as a rectangular player instead of a voice bubble).
+Without ffmpeg, Edge TTS, MiniMax, and NeuTTS audio are sent as regular audio files (playable, but shown as a rectangular player instead of a voice bubble).
 
 :::tip
 If you want voice bubbles without installing ffmpeg, switch to the OpenAI or ElevenLabs provider.

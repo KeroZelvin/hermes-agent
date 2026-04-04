@@ -201,6 +201,29 @@ class TestStreamingTTSActivation:
 
         assert use_streaming_tts is True
 
+    def test_activates_when_minimax_streaming_backend_is_available(self):
+        from tools.tts_registry import RegisteredTTSProvider
+        from tools.tts_tool import ResolvedStreamingTTSProvider
+
+        with patch("tools.tts_tool._load_tts_config", return_value={"provider": "minimax", "minimax": {"streaming_mode": "websocket"}}), \
+             patch("tools.tts_tool.resolve_streaming_tts_provider", return_value=ResolvedStreamingTTSProvider(
+                 requested_provider="minimax",
+                 provider="minimax",
+                 provider_entry=RegisteredTTSProvider(
+                     synthesize=lambda *_args, **_kwargs: "",
+                     is_available=lambda _cfg: True,
+                     is_streaming_available=lambda _cfg: True,
+                     stream_sentence=lambda *_args, **_kwargs: None,
+                 ),
+                 available=True,
+                 error=None,
+                 tts_config={"provider": "minimax", "minimax": {"streaming_mode": "websocket"}},
+             )):
+            from tools.tts_tool import _load_tts_config as load_cfg, resolve_streaming_tts_provider
+            use_streaming_tts = resolve_streaming_tts_provider(load_cfg()).available
+
+        assert use_streaming_tts is True
+
     def test_does_not_activate_when_streaming_backend_is_unavailable(self):
         from tools.tts_tool import ResolvedStreamingTTSProvider
 
