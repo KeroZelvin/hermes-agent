@@ -650,8 +650,10 @@ def streaming_tts_available(tts_config: Optional[Dict[str, Any]] = None, *, vali
         return True
 
     provider_entry = resolved.provider_entry
-    if provider_entry is None or provider_entry.streaming_setup is None:
+    if provider_entry is None:
         return False
+    if provider_entry.streaming_setup is None:
+        return True
 
     state = None
     try:

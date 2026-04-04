@@ -218,6 +218,29 @@ class TestStreamingTTSActivation:
 
         assert use_streaming_tts is False
 
+    def test_setup_less_streaming_provider_passes_validate_setup(self):
+        from tools.tts_registry import RegisteredTTSProvider
+        from tools.tts_tool import streaming_tts_available
+
+        provider = RegisteredTTSProvider(
+            synthesize=lambda *_args, **_kwargs: "",
+            is_available=lambda _cfg: True,
+            is_streaming_available=lambda _cfg: True,
+            stream_sentence=lambda *_args, **_kwargs: None,
+        )
+
+        with patch("tools.tts_tool.resolve_streaming_tts_provider") as mock_resolve:
+            from tools.tts_tool import ResolvedStreamingTTSProvider
+            mock_resolve.return_value = ResolvedStreamingTTSProvider(
+                requested_provider="custom",
+                provider="custom",
+                provider_entry=provider,
+                available=True,
+                error=None,
+                tts_config={"provider": "custom"},
+            )
+            assert streaming_tts_available({"provider": "custom"}, validate_setup=True) is True
+
     def test_stale_boolean_imports_no_longer_exist(self):
         """Confirm _HAS_ELEVENLABS and _HAS_AUDIO are not in tts_tool module."""
         import tools.tts_tool as tts_mod
