@@ -1148,16 +1148,14 @@ class BasePlatformAdapter(ABC):
                         and not media_files
                         and event.source.chat_id not in self._auto_tts_disabled_chats):
                     try:
-                        from tools.tts_tool import text_to_speech_tool, check_tts_requirements
-                        if check_tts_requirements():
-                            import json as _json
-                            speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+                        from tools.tts_tool import generate_tts_result, resolve_tts_provider, _strip_markdown_for_tts
+                        if resolve_tts_provider().available:
+                            speech_text = _strip_markdown_for_tts(text_content[:4000]).strip()
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
-                            tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool, text=speech_text
+                            tts_data = await asyncio.to_thread(
+                                generate_tts_result, text=speech_text
                             )
-                            tts_data = _json.loads(tts_result_str)
                             _tts_path = tts_data.get("file_path")
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
