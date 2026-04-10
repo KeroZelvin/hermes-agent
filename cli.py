@@ -7606,9 +7606,9 @@ class HermesCLI:
             self._reasoning_shown_this_turn = False
 
             # --- Streaming TTS setup ---
-            # When ElevenLabs is the TTS provider and sounddevice is available,
-            # we stream audio sentence-by-sentence as the agent generates tokens
-            # instead of waiting for the full response.
+            # For providers with a validated live-streaming backend, stream audio
+            # sentence-by-sentence as the agent generates tokens instead of
+            # waiting for the full response.
             use_streaming_tts = False
             _streaming_box_opened = False
             text_queue = None
@@ -7620,16 +7620,11 @@ class HermesCLI:
                 try:
                     from tools.tts_tool import (
                         _load_tts_config as _load_tts_cfg,
-                        _get_provider as _get_prov,
-                        _import_elevenlabs,
-                        _import_sounddevice,
+                        streaming_tts_available,
                         stream_tts_to_speaker,
                     )
                     _tts_cfg = _load_tts_cfg()
-                    if _get_prov(_tts_cfg) == "elevenlabs":
-                        # Verify both ElevenLabs SDK and audio output are available
-                        _import_elevenlabs()
-                        _import_sounddevice()
+                    if streaming_tts_available(_tts_cfg, validate_setup=True):
                         use_streaming_tts = True
                 except (ImportError, OSError):
                     pass

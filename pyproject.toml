@@ -51,6 +51,7 @@ voice = [
   # so keep it out of the base install for source-build packagers like Homebrew.
   "faster-whisper>=1.0.0,<2",
   "sounddevice>=0.4.6,<1",
+  "websockets>=12,<16",
   "numpy>=1.24.0,<3",
 ]
 pty = [
