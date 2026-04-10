@@ -293,6 +293,24 @@ class TestStreamingTTSActivation:
         assert not hasattr(tts_mod, "_HAS_AUDIO"), \
             "_HAS_AUDIO should not exist -- lazy imports replaced it"
 
+    def test_streaming_tts_available_for_minimax_websocket(self):
+        from tools.tts_tool import streaming_tts_available
+
+        with patch("tools.tts_tool._import_websockets", return_value=MagicMock()), \
+             patch("tools.tts_tool._resolve_minimax_api_key", return_value="mm-key"):
+            assert streaming_tts_available(
+                {"provider": "minimax", "minimax": {"streaming_mode": "websocket", "voice_id": "English_BossyLeader"}},
+                validate_setup=True,
+            ) is True
+
+    def test_streaming_tts_unavailable_for_minimax_without_websocket_mode(self):
+        from tools.tts_tool import streaming_tts_available
+
+        assert streaming_tts_available(
+            {"provider": "minimax", "minimax": {"voice_id": "English_BossyLeader"}},
+            validate_setup=True,
+        ) is False
+
 
 # ============================================================================
 # Voice mode user message prefix (Bug B fix)

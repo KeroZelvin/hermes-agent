@@ -74,6 +74,11 @@ def _import_sounddevice():
     import sounddevice as sd
     return sd
 
+def _import_websockets():
+    """Lazy import websockets. Returns the module or raises ImportError."""
+    import websockets
+    return websockets
+
 
 # ===========================================================================
 # Defaults
@@ -125,6 +130,269 @@ def _load_tts_config() -> Dict[str, Any]:
 def _get_provider(tts_config: Dict[str, Any]) -> str:
     """Get the configured TTS provider name."""
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+
+
+def _resolve_minimax_api_key() -> str:
+    """Resolve the MiniMax API key from process env or Hermes env-store."""
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
+    if api_key:
+        return api_key
+    try:
+        from hermes_cli.config import get_env_value
+
+        api_key = (get_env_value("MINIMAX_API_KEY") or "").strip()
+        if api_key:
+            return api_key
+    except Exception:
+        pass
+    raise ValueError("MINIMAX_API_KEY not set. Get one at https://platform.minimax.io/")
+
+
+def _normalize_minimax_base_url(base_url: str) -> str:
+    """Normalize configured MiniMax base URLs to the API origin.
+
+    Accepts either the API root (``https://api.minimax.io``), ``/v1`` roots,
+    or the legacy ``/v1/t2a_v2`` endpoint path and normalizes them to the root.
+    """
+    normalized = (base_url or DEFAULT_MINIMAX_BASE_URL).strip().rstrip("/")
+    if normalized.endswith("/v1/t2a_v2"):
+        normalized = normalized[: -len("/v1/t2a_v2")]
+    if normalized.endswith("/v1"):
+        normalized = normalized[: -len("/v1")]
+    return normalized or "https://api.minimax.io"
+
+
+def _get_minimax_t2a_url(base_url: str) -> str:
+    return f"{_normalize_minimax_base_url(base_url)}/v1/t2a_v2"
+
+
+def _get_minimax_ws_url(base_url: str) -> str:
+    normalized = _normalize_minimax_base_url(base_url)
+    if normalized.startswith("https://"):
+        return f"wss://{normalized[len('https://'):]}/ws/v1/t2a_v2"
+    if normalized.startswith("http://"):
+        return f"ws://{normalized[len('http://'):]}/ws/v1/t2a_v2"
+    return f"wss://{normalized}/ws/v1/t2a_v2"
+
+
+def _get_streaming_tts_backend(tts_config: Dict[str, Any]) -> Optional[str]:
+    provider = _get_provider(tts_config)
+    if provider == "elevenlabs":
+        return "elevenlabs"
+    if provider == "minimax":
+        minimax_cfg = tts_config.get("minimax", {}) or {}
+        mode = (minimax_cfg.get("streaming_mode") or "").strip().lower()
+        if mode == "websocket":
+            return "minimax_websocket"
+    return None
+
+
+def _minimax_ws_runtime(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    mm_config = tts_config.get("minimax", {}) or {}
+    return {
+        "api_key": _resolve_minimax_api_key(),
+        "base_url": _normalize_minimax_base_url(
+            mm_config.get("base_url") or os.getenv("MINIMAX_BASE_URL") or DEFAULT_MINIMAX_BASE_URL
+        ),
+        "model": mm_config.get("model", DEFAULT_MINIMAX_MODEL),
+        "voice_id": mm_config.get("voice_id", DEFAULT_MINIMAX_VOICE_ID),
+        "speed": float(mm_config.get("speed", 1)),
+        "vol": float(mm_config.get("vol", 1)),
+        "pitch": int(mm_config.get("pitch", 0)),
+    }
+
+
+def _is_minimax_streaming_available(tts_config: Dict[str, Any]) -> bool:
+    if _get_streaming_tts_backend(tts_config) != "minimax_websocket":
+        return False
+    _import_websockets()
+    runtime = _minimax_ws_runtime(tts_config)
+    return bool(runtime.get("voice_id"))
+
+
+def _parse_minimax_ws_status(payload: Dict[str, Any], label: str) -> None:
+    base_resp = payload.get("base_resp") or {}
+    if not isinstance(base_resp, dict):
+        raise ValueError(f"MiniMax {label} response envelope is malformed")
+    status_code = base_resp.get("status_code", 0)
+    if status_code == 0:
+        return
+    status_msg = base_resp.get("status_msg", "unknown error")
+    raise ValueError(f"MiniMax {label} failed: status_code={status_code} {status_msg}")
+
+
+def _require_minimax_event(payload: Dict[str, Any], expected_event: str, label: str) -> None:
+    actual_event = (payload.get("event") or "").strip()
+    if actual_event != expected_event:
+        raise ValueError(
+            f"MiniMax {label} returned unexpected event: expected {expected_event}, got {actual_event or 'missing'}"
+        )
+
+
+async def _stream_minimax_ws_audio(
+    text: str,
+    runtime: Dict[str, Any],
+    on_audio_chunk: Callable[[bytes], None],
+    stop_event: threading.Event,
+) -> None:
+    websockets = _import_websockets()
+    ws_url = _get_minimax_ws_url(runtime["base_url"])
+    headers = {"Authorization": f"Bearer {runtime['api_key']}"}
+
+    async with websockets.connect(ws_url, additional_headers=headers, max_size=None) as websocket:
+        connected_payload = json.loads(await websocket.recv())
+        _parse_minimax_ws_status(connected_payload, "websocket connect")
+        _require_minimax_event(connected_payload, "connected_success", "websocket connect")
+
+        await websocket.send(json.dumps({
+            "event": "task_start",
+            "model": runtime["model"],
+            "voice_setting": {
+                "voice_id": runtime["voice_id"],
+                "speed": runtime["speed"],
+                "vol": runtime["vol"],
+                "pitch": runtime["pitch"],
+            },
+            "audio_setting": {
+                "sample_rate": 32000,
+                "bitrate": 128000,
+                "format": "mp3",
+                "channel": 1,
+            },
+        }))
+
+        started_payload = json.loads(await websocket.recv())
+        _parse_minimax_ws_status(started_payload, "websocket start")
+        _require_minimax_event(started_payload, "task_started", "websocket start")
+
+        await websocket.send(json.dumps({"event": "task_continue", "text": text}))
+
+        sent_finish = False
+        finish_ack_received = False
+        while not stop_event.is_set():
+            message = json.loads(await websocket.recv())
+            _parse_minimax_ws_status(message, "websocket stream")
+            event = (message.get("event") or "").strip()
+
+            if event == "task_failed":
+                raise ValueError("MiniMax websocket stream failed")
+            if event == "task_finished":
+                finish_ack_received = True
+                break
+            if sent_finish:
+                raise ValueError(
+                    f"MiniMax websocket finish returned unexpected event: expected task_finished, got {event or 'missing'}"
+                )
+            if event != "task_continued":
+                raise ValueError(f"MiniMax websocket stream returned unexpected event: {event or 'missing'}")
+
+            audio_hex = ((message.get("data") or {}).get("audio") or "").strip()
+            if audio_hex:
+                on_audio_chunk(bytes.fromhex(audio_hex))
+
+            if message.get("is_final") and not sent_finish:
+                await websocket.send(json.dumps({"event": "task_finish"}))
+                sent_finish = True
+
+        if not sent_finish:
+            await websocket.send(json.dumps({"event": "task_finish"}))
+            sent_finish = True
+
+        if sent_finish and not finish_ack_received:
+            finished_payload = json.loads(await websocket.recv())
+            _parse_minimax_ws_status(finished_payload, "websocket finish")
+            _require_minimax_event(finished_payload, "task_finished", "websocket finish")
+
+
+def _play_mp3_bytes_via_tempfile(audio_bytes: bytes):
+    tmp_path = None
+    tmp = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        with open(tmp_path, "wb") as handle:
+            handle.write(audio_bytes)
+        from tools.voice_mode import play_audio_file
+        play_audio_file(tmp_path)
+    except Exception as exc:
+        logger.warning("MP3 temp-file TTS fallback failed: %s", exc)
+    finally:
+        if tmp is not None:
+            try:
+                tmp.close()
+            except Exception:
+                pass
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _stream_sentence_minimax_ws(
+    sentence: str,
+    _tts_config: Dict[str, Any],
+    state: Dict[str, Any],
+    stop_event: threading.Event,
+) -> None:
+    collected: list[bytes] = []
+    ffplay_proc = None
+    ffplay = shutil.which("ffplay")
+    if ffplay:
+        try:
+            ffplay_proc = subprocess.Popen(
+                [ffplay, "-nodisp", "-autoexit", "-loglevel", "error", "-i", "pipe:0"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logger.debug("ffplay unavailable for MiniMax live streaming: %s", exc)
+            ffplay_proc = None
+
+    def _on_chunk(chunk: bytes) -> None:
+        if stop_event.is_set():
+            return
+        collected.append(chunk)
+        if ffplay_proc and ffplay_proc.stdin and ffplay_proc.poll() is None:
+            try:
+                ffplay_proc.stdin.write(chunk)
+                ffplay_proc.stdin.flush()
+            except Exception:
+                pass
+
+    try:
+        asyncio.run(_stream_minimax_ws_audio(sentence, state, _on_chunk, stop_event))
+    finally:
+        if ffplay_proc and ffplay_proc.stdin:
+            try:
+                ffplay_proc.stdin.close()
+                ffplay_proc.wait(timeout=15)
+            except Exception:
+                ffplay_proc.kill()
+
+    if ffplay_proc is None and collected:
+        _play_mp3_bytes_via_tempfile(b"".join(collected))
+
+
+def streaming_tts_available(tts_config: Optional[Dict[str, Any]] = None, *, validate_setup: bool = False) -> bool:
+    config = _load_tts_config() if tts_config is None else tts_config
+    backend = _get_streaming_tts_backend(config)
+    if backend == "elevenlabs":
+        try:
+            _import_elevenlabs()
+            if validate_setup:
+                _import_sounddevice()
+            return bool(os.getenv("ELEVENLABS_API_KEY", ""))
+        except Exception:
+            return False
+    if backend == "minimax_websocket":
+        try:
+            return _is_minimax_streaming_available(config)
+        except Exception:
+            return False
+    return False
 
 
 # ===========================================================================
@@ -307,9 +575,7 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
     """
     import requests
 
-    api_key = os.getenv("MINIMAX_API_KEY", "")
-    if not api_key:
-        raise ValueError("MINIMAX_API_KEY not set. Get one at https://platform.minimax.io/")
+    api_key = _resolve_minimax_api_key()
 
     mm_config = tts_config.get("minimax", {})
     model = mm_config.get("model", DEFAULT_MINIMAX_MODEL)
@@ -317,7 +583,7 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
     speed = mm_config.get("speed", 1)
     vol = mm_config.get("vol", 1)
     pitch = mm_config.get("pitch", 0)
-    base_url = mm_config.get("base_url", DEFAULT_MINIMAX_BASE_URL)
+    base_url = _get_minimax_t2a_url(mm_config.get("base_url", DEFAULT_MINIMAX_BASE_URL))
 
     # Determine audio format from output extension
     if output_path.endswith(".wav"):
@@ -720,8 +986,11 @@ def check_tts_requirements() -> bool:
             return True
     except ImportError:
         pass
-    if os.getenv("MINIMAX_API_KEY"):
-        return True
+    try:
+        if _resolve_minimax_api_key():
+            return True
+    except Exception:
+        pass
     try:
         _import_mistral_client()
         if os.getenv("MISTRAL_API_KEY"):
@@ -796,108 +1065,67 @@ def stream_tts_to_speaker(
     tts_done_event: threading.Event,
     display_callback: Optional[Callable[[str], None]] = None,
 ):
-    """Consume text deltas from *text_queue*, buffer them into sentences,
-    and stream each sentence through ElevenLabs TTS to the speaker in
-    real-time.
+    """Consume text deltas, buffer them into sentences, and speak them live.
 
-    Protocol:
-        * The producer puts ``str`` deltas onto *text_queue*.
-        * A ``None`` sentinel signals end-of-text (flush remaining buffer).
-        * *stop_event* can be set to abort early (e.g. user interrupt).
-        * *tts_done_event* is **set** in the ``finally`` block so callers
-          waiting on it (continuous voice mode) know playback is finished.
+    Supports the existing ElevenLabs sentence-by-sentence streaming path plus
+    MiniMax websocket streaming when ``tts.minimax.streaming_mode=websocket``.
     """
     tts_done_event.clear()
 
     try:
-        # --- TTS client setup (optional -- display_callback works without it) ---
         client = None
         output_stream = None
         voice_id = DEFAULT_ELEVENLABS_VOICE_ID
         model_id = DEFAULT_ELEVENLABS_STREAMING_MODEL_ID
-
         tts_config = _load_tts_config()
-        el_config = tts_config.get("elevenlabs", {})
-        voice_id = el_config.get("voice_id", voice_id)
-        model_id = el_config.get("streaming_model_id",
-                                 el_config.get("model_id", model_id))
+        streaming_backend = _get_streaming_tts_backend(tts_config)
+        minimax_state: Optional[Dict[str, Any]] = None
 
-        api_key = os.getenv("ELEVENLABS_API_KEY", "")
-        if not api_key:
-            logger.warning("ELEVENLABS_API_KEY not set; streaming TTS audio disabled")
-        else:
-            try:
-                ElevenLabs = _import_elevenlabs()
-                client = ElevenLabs(api_key=api_key)
-            except ImportError:
-                logger.warning("elevenlabs package not installed; streaming TTS disabled")
+        if streaming_backend == "elevenlabs":
+            el_config = tts_config.get("elevenlabs", {})
+            voice_id = el_config.get("voice_id", voice_id)
+            model_id = el_config.get("streaming_model_id", el_config.get("model_id", model_id))
 
-            # Open a single sounddevice output stream for the lifetime of
-            # this function.  ElevenLabs pcm_24000 produces signed 16-bit
-            # little-endian mono PCM at 24 kHz.
-            if client is not None:
+            api_key = os.getenv("ELEVENLABS_API_KEY", "")
+            if not api_key:
+                logger.warning("ELEVENLABS_API_KEY not set; streaming TTS audio disabled")
+                streaming_backend = None
+            else:
                 try:
-                    sd = _import_sounddevice()
-                    output_stream = sd.OutputStream(
-                        samplerate=24000, channels=1, dtype="int16",
-                    )
-                    output_stream.start()
-                except (ImportError, OSError) as exc:
-                    logger.debug("sounddevice not available: %s", exc)
-                    output_stream = None
-                except Exception as exc:
-                    logger.warning("sounddevice OutputStream failed: %s", exc)
-                    output_stream = None
+                    ElevenLabs = _import_elevenlabs()
+                    client = ElevenLabs(api_key=api_key)
+                except ImportError:
+                    logger.warning("elevenlabs package not installed; streaming TTS disabled")
+                    streaming_backend = None
+
+                if client is not None:
+                    try:
+                        sd = _import_sounddevice()
+                        output_stream = sd.OutputStream(
+                            samplerate=24000, channels=1, dtype="int16",
+                        )
+                        output_stream.start()
+                    except (ImportError, OSError) as exc:
+                        logger.debug("sounddevice not available: %s", exc)
+                        output_stream = None
+                    except Exception as exc:
+                        logger.warning("sounddevice OutputStream failed: %s", exc)
+                        output_stream = None
+
+        elif streaming_backend == "minimax_websocket":
+            try:
+                _import_websockets()
+                minimax_state = _minimax_ws_runtime(tts_config)
+            except Exception as exc:
+                logger.warning("MiniMax websocket streaming unavailable: %s", exc)
+                streaming_backend = None
 
         sentence_buf = ""
         min_sentence_len = 20
         long_flush_len = 100
         queue_timeout = 0.5
-        _spoken_sentences: list[str] = []  # track spoken sentences to skip duplicates
-        # Regex to strip complete <think>...</think> blocks from buffer
+        _spoken_sentences: list[str] = []
         _think_block_re = re.compile(r'<think[\s>].*?</think>', flags=re.DOTALL)
-
-        def _speak_sentence(sentence: str):
-            """Display sentence and optionally generate + play audio."""
-            if stop_event.is_set():
-                return
-            cleaned = _strip_markdown_for_tts(sentence).strip()
-            if not cleaned:
-                return
-            # Skip duplicate/near-duplicate sentences (LLM repetition)
-            cleaned_lower = cleaned.lower().rstrip(".!,")
-            for prev in _spoken_sentences:
-                if prev.lower().rstrip(".!,") == cleaned_lower:
-                    return
-            _spoken_sentences.append(cleaned)
-            # Display raw sentence on screen before TTS processing
-            if display_callback is not None:
-                display_callback(sentence)
-            # Skip audio generation if no TTS client available
-            if client is None:
-                return
-            # Truncate very long sentences
-            if len(cleaned) > MAX_TEXT_LENGTH:
-                cleaned = cleaned[:MAX_TEXT_LENGTH]
-            try:
-                audio_iter = client.text_to_speech.convert(
-                    text=cleaned,
-                    voice_id=voice_id,
-                    model_id=model_id,
-                    output_format="pcm_24000",
-                )
-                if output_stream is not None:
-                    for chunk in audio_iter:
-                        if stop_event.is_set():
-                            break
-                        import numpy as _np
-                        audio_array = _np.frombuffer(chunk, dtype=_np.int16)
-                        output_stream.write(audio_array.reshape(-1, 1))
-                else:
-                    # Fallback: write chunks to temp file and play via system player
-                    _play_via_tempfile(audio_iter, stop_event)
-            except Exception as exc:
-                logger.warning("Streaming TTS sentence failed: %s", exc)
 
         def _play_via_tempfile(audio_iter, stop_evt):
             """Write PCM chunks to a temp WAV file and play it."""
@@ -908,7 +1136,7 @@ def stream_tts_to_speaker(
                 tmp_path = tmp.name
                 with wave.open(tmp, "wb") as wf:
                     wf.setnchannels(1)
-                    wf.setsampwidth(2)  # 16-bit
+                    wf.setsampwidth(2)
                     wf.setframerate(24000)
                     for chunk in audio_iter:
                         if stop_evt.is_set():
@@ -925,37 +1153,72 @@ def stream_tts_to_speaker(
                     except OSError:
                         pass
 
+        def _speak_sentence(sentence: str):
+            if stop_event.is_set():
+                return
+            cleaned = _strip_markdown_for_tts(sentence).strip()
+            if not cleaned:
+                return
+            cleaned_lower = cleaned.lower().rstrip(".!?,")
+            for prev in _spoken_sentences:
+                if prev.lower().rstrip(".!?,") == cleaned_lower:
+                    return
+            _spoken_sentences.append(cleaned)
+
+            if display_callback is not None:
+                display_callback(sentence)
+
+            if len(cleaned) > MAX_TEXT_LENGTH:
+                cleaned = cleaned[:MAX_TEXT_LENGTH]
+
+            if streaming_backend == "minimax_websocket" and minimax_state is not None:
+                try:
+                    _stream_sentence_minimax_ws(cleaned, tts_config, minimax_state, stop_event)
+                except Exception as exc:
+                    logger.warning("Streaming TTS sentence failed: %s", exc)
+                return
+
+            if client is None:
+                return
+            try:
+                audio_iter = client.text_to_speech.convert(
+                    text=cleaned,
+                    voice_id=voice_id,
+                    model_id=model_id,
+                    output_format="pcm_24000",
+                )
+                if output_stream is not None:
+                    for chunk in audio_iter:
+                        if stop_event.is_set():
+                            break
+                        import numpy as _np
+                        audio_array = _np.frombuffer(chunk, dtype=_np.int16)
+                        output_stream.write(audio_array.reshape(-1, 1))
+                else:
+                    _play_via_tempfile(audio_iter, stop_event)
+            except Exception as exc:
+                logger.warning("Streaming TTS sentence failed: %s", exc)
+
         while not stop_event.is_set():
-            # Read next delta from queue
             try:
                 delta = text_queue.get(timeout=queue_timeout)
             except queue.Empty:
-                # Timeout: if we have accumulated a long buffer, flush it
                 if len(sentence_buf) > long_flush_len:
                     _speak_sentence(sentence_buf)
                     sentence_buf = ""
                 continue
 
             if delta is None:
-                # End-of-text sentinel: strip any remaining think blocks, flush
                 sentence_buf = _think_block_re.sub('', sentence_buf)
                 if sentence_buf.strip():
                     _speak_sentence(sentence_buf)
                 break
 
             sentence_buf += delta
-
-            # --- Think block filtering ---
-            # Strip complete <think>...</think> blocks from buffer.
-            # Works correctly even when tags span multiple deltas.
             sentence_buf = _think_block_re.sub('', sentence_buf)
-
-            # If an incomplete <think tag is at the end, wait for more data
-            # before extracting sentences (the closing tag may arrive next).
             if '<think' in sentence_buf and '</think>' not in sentence_buf:
                 continue
 
-            # Check for sentence boundaries
             while True:
                 m = _SENTENCE_BOUNDARY_RE.search(sentence_buf)
                 if m is None:
@@ -963,25 +1226,20 @@ def stream_tts_to_speaker(
                 end_pos = m.end()
                 sentence = sentence_buf[:end_pos]
                 sentence_buf = sentence_buf[end_pos:]
-                # Merge short fragments into the next sentence
                 if len(sentence.strip()) < min_sentence_len:
                     sentence_buf = sentence + sentence_buf
                     break
                 _speak_sentence(sentence)
 
-        # Drain any remaining items from the queue
         while True:
             try:
                 text_queue.get_nowait()
             except queue.Empty:
                 break
 
-        # output_stream is closed in the finally block below
-
     except Exception as exc:
         logger.warning("Streaming TTS pipeline error: %s", exc)
     finally:
-        # Always close the audio output stream to avoid locking the device
         if output_stream is not None:
             try:
                 output_stream.stop()
